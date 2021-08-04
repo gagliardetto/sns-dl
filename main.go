@@ -4,7 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"log"
 	"math"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,51 +21,63 @@ import (
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/gagliardetto/streamject"
 	. "github.com/gagliardetto/utilz"
+	"github.com/joho/godotenv"
 	"github.com/mr-tron/base58"
 )
 
 var (
 	bonfidaAuctionProgramKey = solana.MustPublicKeyFromBase58("AVWV7vdWbLqXiLKFaP19GhYurhwxaLp2qRBSjT5tR5vT")
 	bonfidaNamesProgramKey   = solana.MustPublicKeyFromBase58("namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX")
+	isProd                   bool
+	domainsFileDir           string
+	domainsFileName          string
+	fileMode                 uint64
 )
 
 func main() {
-
-	dir := "domains"
-
-	MustCreateFolderIfNotExists(dir, 0666)
-
-	fn := filepath.Join(dir, "domains_v3.json")
-
-	stm, err := streamject.NewJSON(fn)
-	if err != nil {
-		panic(err)
+	envPath := flag.String("env", ".env", "path for environment variables")
+	flag.Parse()
+	var err error
+	if err = godotenv.Load(*envPath); err != nil {
+		log.Fatalln("Error loading environment variables: ", err)
 	}
-	defer stm.Close()
+	isProdS := os.Getenv("IS_PROD")
+	isProd, err = strconv.ParseBool(isProdS)
+	checkError(err)
 
-	ctx := context.Background()
+	domainsFileDir = os.Getenv("DOMAINS_FILE_DIR")
+	domainsFileName = os.Getenv("DOMAINS_FILE_NAME")
+	fileModeS := os.Getenv("FILE_MODE")
+	fileMode, err = strconv.ParseUint(fileModeS, 8, 32)
+	checkError(err)
+
+	MustCreateFolderIfNotExists(domainsFileDir, fs.FileMode(fileMode))
 
 	rpcWithRate := rpc.NewWithRateLimit(
-		rpc.MainNetBeta_RPC,
+		os.Getenv("RPC_ENDPOINT"),
 		3,
 	)
-	client := rpc.NewWithCustomRPCClient(rpcWithRate)
+
+	path := filepath.Join(domainsFileDir, domainsFileName)
+	stm, err := streamject.NewJSON(path)
+	checkError(err)
+	defer stm.Close()
+
+	c := rpc.NewWithCustomRPCClient(rpcWithRate)
+	run(c, stm)
+}
+
+func run(client *rpc.Client, stm *streamject.Stream) {
 	out, err := client.GetProgramAccountsWithOpts(
-		ctx,
-		// solana.MustPublicKeyFromBase58("namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX"),
-		// solana.MustPublicKeyFromBase58("11111111111111111111111111111111"),
+		context.Background(),
 		bonfidaAuctionProgramKey,
-		// solana.MustPublicKeyFromBase58("jCebN34bUfdeUYJT13J1yG16XWQpt5PDx6Mse9GUqhR"),
 		&rpc.GetProgramAccountsOpts{
 			Encoding: solana.EncodingJSONParsed,
 		},
 	)
-	if err != nil {
-		panic(err)
-	}
+	checkError(err)
 
 	targets := []solana.PublicKey{}
-	isProd := true
 	for accountIndex := range out {
 		targets = append(targets,
 			out[accountIndex].Pubkey,
@@ -75,23 +92,21 @@ func main() {
 	for _, auctionPubkey := range targets {
 		Sfln(OrangeBG("%s"), auctionPubkey)
 		if isProd && hasByAuctionKey(stm, auctionPubkey) {
-			Ln("already done; skipping")
-		} else {
-			err := processAuction(stm, client, auctionPubkey, isProd)
-			if err != nil {
-				if strings.Contains(err.Error(), "Connection rate limits exceeded") {
-					Ln(err.Error())
-					time.Sleep(time.Minute)
-					continue
-				}
-				Sfln(Red("err while %s: %s"), auctionPubkey, err)
-				err = stm.Append(&EmptyItem{
-					AuctionKey: auctionPubkey,
-				})
-				if err != nil {
-					panic(err)
-				}
+			Ln(fmt.Sprintf("%s auctionPubkey already done; skipping", auctionPubkey))
+			continue
+		}
+		err := processAuction(stm, client, auctionPubkey, isProd)
+		if err != nil {
+			if strings.Contains(err.Error(), "Connection rate limits exceeded") {
+				Ln(fmt.Sprintf("%s auctionPubkey is being ratelimited: %s", auctionPubkey, err.Error()))
+				time.Sleep(time.Minute)
+				continue
 			}
+			Sfln(Red("err while %s: %s"), auctionPubkey, err)
+			err = stm.Append(&EmptyItem{
+				AuctionKey: auctionPubkey,
+			})
+			checkError(err)
 		}
 	}
 	Sfln(Shakespeare("%v"), len(out))
@@ -100,7 +115,7 @@ func main() {
 	// - GetProgramAccountsWithOpts for AVWV7vdWbLqXiLKFaP19GhYurhwxaLp2qRBSjT5tR5vT as auctionAccounts
 	// - foreach auctionAccounts as auctionAccount
 	// 		- get transactions for auctionAccount
-	//      - get first transaction: get inner instructions; last inner instruction on(namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX) contains the name
+	//    	- get first transaction: get inner instructions; last inner instruction on(namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX) contains the name
 	// 		- after last 00 00 00 comes the domain
 }
 
@@ -110,15 +125,9 @@ func processAuction(
 	auctionPubkey solana.PublicKey,
 	isProd bool,
 ) error {
-
-	ctx := context.Background()
-
-	domainItem := DomainItem{}
-	canceledBids := make(map[string]bool)
-
-	domainItem.AuctionKey = auctionPubkey
 	Sfln(Shakespeare("----- %s"), "auctionPubkey above")
 
+	ctx := context.Background()
 	signatures, err := client.GetConfirmedSignaturesForAddress2(
 		ctx,
 		auctionPubkey,
@@ -135,6 +144,7 @@ func processAuction(
 		return errors.New("no signatures")
 	}
 
+	var domainItem DomainItem
 	// Figure out what is the domain in the auction (if any):
 	{
 		oldestSignature := signatures[len(signatures)-1]
@@ -194,17 +204,20 @@ func processAuction(
 			oldestSignature.BlockTime.Time(),
 			blockTimeInt64,
 		)
-
-		domainItem.DomainName = string(name)
-		domainItem.Creator = creator
-		domainItem.Slot = uint64(oldestSignature.Slot)
-		domainItem.BlockTime = oldestSignature.BlockTime.Time()
-		domainItem.BlockTimeInt64 = blockTimeInt64
-		domainItem.FirstTx = oldestSignature.Signature
+		domainItem = DomainItem{
+			AuctionKey:     auctionPubkey,
+			DomainName:     string(name),
+			Creator:        creator,
+			Slot:           uint64(oldestSignature.Slot),
+			BlockTime:      oldestSignature.BlockTime.Time(),
+			BlockTimeInt64: blockTimeInt64,
+			FirstTx:        oldestSignature.Signature,
+		}
 	}
 
 	// Find the latest bid (if any):
 	if len(signatures) > 1 {
+		canceledBids := make(map[string]bool)
 		for i := 0; i < len(signatures)-1; i++ {
 			mostRecentSignature := signatures[i]
 			spew.Dump(mostRecentSignature)
@@ -237,7 +250,6 @@ func processAuction(
 					bidCancelID := Sf("%s:%v", bidder, math.Abs(float64(bidAmount)))
 					canceledBids[bidCancelID] = true
 				}
-				// panic(Sf("canceled bid %s", bidCancelID))
 				continue
 			}
 			if SliceContains(tx.Meta.LogMessages, "Program log: Instruction: Claim") {
@@ -255,45 +267,40 @@ func processAuction(
 
 			if len(tx.Meta.PreTokenBalances) == 0 || len(tx.Meta.PostTokenBalances) == 0 {
 				Ln("warn: no PreTokenBalances or PostTokenBalances")
-			} else {
-				preTokenBalance := tx.Meta.PreTokenBalances[0]
-				postTokenBalance := tx.Meta.PostTokenBalances[0]
+				continue
+			}
+			preTokenBalance := tx.Meta.PreTokenBalances[0]
+			postTokenBalance := tx.Meta.PostTokenBalances[0]
 
-				bidAmount := mustParseInt64(preTokenBalance.UiTokenAmount.Amount) - mustParseInt64(postTokenBalance.UiTokenAmount.Amount)
+			bidAmount := mustParseInt64(preTokenBalance.UiTokenAmount.Amount) - mustParseInt64(postTokenBalance.UiTokenAmount.Amount)
 
-				bidCancelID := Sf("%s:%v", bidder, math.Abs(float64(bidAmount)))
-				if _, ok := canceledBids[bidCancelID]; ok {
-					Ln("warn: this bid was canceled")
-					continue
-				}
-
-				blockTimeInt64 := int64(*mostRecentSignature.BlockTime)
-				Sfln(
-					" latest offer from account %s for %v USDC",
-					bidder,
-					bidAmount,
-				)
-				// TODO:
-				// - check that it's a bid, and not a revoked bid
-				domainItem.MaxBid.Amount = bidAmount
-				domainItem.MaxBid.Bidder = bidder
-				domainItem.MaxBid.Slot = uint64(mostRecentSignature.Slot)
-				domainItem.MaxBid.BlockTime = mostRecentSignature.BlockTime.Time()
-				domainItem.MaxBid.BlockTimeInt64 = blockTimeInt64
-				domainItem.MaxBid.Tx = mostRecentSignature.Signature
-				break
+			bidCancelID := Sf("%s:%v", bidder, math.Abs(float64(bidAmount)))
+			if _, ok := canceledBids[bidCancelID]; ok {
+				Ln("warn: this bid was canceled")
+				continue
 			}
 
+			blockTimeInt64 := int64(*mostRecentSignature.BlockTime)
+			Sfln(
+				" latest offer from account %s for %v USDC",
+				bidder,
+				bidAmount,
+			)
+			// TODO:
+			// - check that it's a bid, and not a revoked bid
+			domainItem.MaxBid.Amount = bidAmount
+			domainItem.MaxBid.Bidder = bidder
+			domainItem.MaxBid.Slot = uint64(mostRecentSignature.Slot)
+			domainItem.MaxBid.BlockTime = mostRecentSignature.BlockTime.Time()
+			domainItem.MaxBid.BlockTimeInt64 = blockTimeInt64
+			domainItem.MaxBid.Tx = mostRecentSignature.Signature
+			break
 		}
 	} else {
 		Sfln("warn: No offers at the moment")
 	}
 
-	err = stm.Append(&domainItem)
-	if err != nil {
-		return err
-	}
-	return nil
+	return stm.Append(&domainItem)
 }
 
 func hasByAuctionKey(stm *streamject.Stream, auctionPubkey solana.PublicKey) bool {
@@ -341,4 +348,10 @@ func mustParseInt64(s string) int64 {
 		panic(err)
 	}
 	return out
+}
+
+func checkError(err error) {
+	if err != nil {
+		panic(err)
+	}
 }
