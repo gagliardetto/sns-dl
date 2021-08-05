@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"fmt"
 	"io/fs"
 	"log"
 	"math"
@@ -92,13 +91,13 @@ func run(client *rpc.Client, stm *streamject.Stream) {
 	for _, auctionPubkey := range targets {
 		Sfln(OrangeBG("%s"), auctionPubkey)
 		if isProd && hasByAuctionKey(stm, auctionPubkey) {
-			Ln(fmt.Sprintf("%s auctionPubkey already done; skipping", auctionPubkey))
+			Sfln("%s auctionPubkey already done; skipping", auctionPubkey)
 			continue
 		}
 		err := processAuction(stm, client, auctionPubkey, isProd)
 		if err != nil {
 			if strings.Contains(err.Error(), "Connection rate limits exceeded") {
-				Ln(fmt.Sprintf("%s auctionPubkey is being ratelimited: %s", auctionPubkey, err.Error()))
+				Sfln("%s auctionPubkey is being ratelimited: %s", auctionPubkey, err)
 				time.Sleep(time.Minute)
 				continue
 			}
@@ -109,7 +108,6 @@ func run(client *rpc.Client, stm *streamject.Stream) {
 			checkError(err)
 		}
 	}
-	Sfln(Shakespeare("%v"), len(out))
 
 	// TODO:
 	// - GetProgramAccountsWithOpts for AVWV7vdWbLqXiLKFaP19GhYurhwxaLp2qRBSjT5tR5vT as auctionAccounts
@@ -307,17 +305,17 @@ func hasByAuctionKey(stm *streamject.Stream, auctionPubkey solana.PublicKey) boo
 
 	indexName := "auction.pubkey"
 
-	stm.CreateIndexOnInt(indexName, func(line streamject.Line) int {
+	stm.CreateIndexByUint64(indexName, func(line streamject.Line) uint64 {
 		var build DomainItem
 		err := line.Decode(&build)
 		if err != nil {
 			panic(err)
 		}
 
-		return int(hashsearch.HashString(build.AuctionKey.String()))
+		return hashsearch.HashString(build.AuctionKey.String())
 	})
 
-	return stm.HasIntByIndex(indexName, int(hashsearch.HashString(auctionPubkey.String())))
+	return stm.HasUint64ByIndex(indexName, hashsearch.HashString(auctionPubkey.String()))
 }
 
 type EmptyItem struct {
