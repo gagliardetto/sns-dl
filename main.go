@@ -12,9 +12,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
+	"github.com/gagliardetto/eta"
 	"github.com/gagliardetto/hashsearch"
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
@@ -22,6 +24,7 @@ import (
 	. "github.com/gagliardetto/utilz"
 	"github.com/joho/godotenv"
 	"github.com/mr-tron/base58"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
@@ -31,6 +34,9 @@ var (
 	domainsFileDir           string
 	domainsFileName          string
 	fileMode                 uint64
+	maxWorkers               int64
+	maxRPS                   int
+	debug                    = false
 )
 
 func main() {
@@ -44,6 +50,14 @@ func main() {
 	isProd, err = strconv.ParseBool(isProdS)
 	checkError(err)
 
+	maxWorkersString := os.Getenv("MAX_WORKERS")
+	maxWorkers, err = strconv.ParseInt(maxWorkersString, 10, 64)
+	checkError(err)
+
+	maxRPSString := os.Getenv("MAX_RPS")
+	maxRPS, err = strconv.Atoi(maxRPSString)
+	checkError(err)
+
 	domainsFileDir = os.Getenv("DOMAINS_FILE_DIR")
 	domainsFileName = os.Getenv("DOMAINS_FILE_NAME")
 	fileModeS := os.Getenv("FILE_MODE")
@@ -54,7 +68,7 @@ func main() {
 
 	rpcWithRate := rpc.NewWithRateLimit(
 		os.Getenv("RPC_ENDPOINT"),
-		3,
+		maxRPS,
 	)
 
 	path := filepath.Join(domainsFileDir, domainsFileName)
@@ -63,10 +77,10 @@ func main() {
 	defer stm.Close()
 
 	c := rpc.NewWithCustomRPCClient(rpcWithRate)
-	run(c, stm)
+	run(c, stm, maxWorkers)
 }
 
-func run(client *rpc.Client, stm *streamject.Stream) {
+func run(client *rpc.Client, stm *streamject.Stream, maxWorkers int64) {
 	out, err := client.GetProgramAccountsWithOpts(
 		context.Background(),
 		bonfidaAuctionProgramKey,
@@ -88,25 +102,53 @@ func run(client *rpc.Client, stm *streamject.Stream) {
 		time.Sleep(time.Second * 5)
 	}
 
-	for _, auctionPubkey := range targets {
-		Sfln(OrangeBG("%s"), auctionPubkey)
-		if isProd && hasByAuctionKey(stm, auctionPubkey) {
-			Sfln("%s auctionPubkey already done; skipping", auctionPubkey)
-			continue
+	pool := NewProcessor(maxWorkers)
+	etac := eta.New(int64(len(targets)))
+
+	go func() {
+		// Print stats:
+		for {
+			time.Sleep(time.Second)
+			Sfln(Shakespeare("[completed: %s]"), etac.GetFormattedPercentDone())
 		}
-		err := processAuction(stm, client, auctionPubkey, isProd)
-		if err != nil {
-			if strings.Contains(err.Error(), "Connection rate limits exceeded") {
-				Sfln("%s auctionPubkey is being ratelimited: %s", auctionPubkey, err)
-				time.Sleep(time.Minute)
-				continue
-			}
-			Sfln(Red("err while %s: %s"), auctionPubkey, err)
-			err = stm.Append(&EmptyItem{
-				AuctionKey: auctionPubkey,
+	}()
+	for auctionPubkeyIndex := range targets {
+		auctionPubkey := targets[auctionPubkeyIndex]
+
+		pool.Enqueue(
+			etac,
+			auctionPubkey,
+			func() error {
+				Sfln(OrangeBG("%s"), auctionPubkey)
+				if isProd && hasByAuctionKey(stm, auctionPubkey) {
+					Sfln("%s auctionPubkey already done; skipping", auctionPubkey)
+					return nil
+				}
+
+				return CombineErrors(
+					RetryLinearBackoff(
+						1000,
+						time.Second*time.Duration(CryptoRandomIntRange(10, 60)),
+
+						func() error {
+							err := processAuction(stm, client, auctionPubkey, isProd)
+							if err != nil {
+								if strings.Contains(err.Error(), "Connection rate limits exceeded") ||
+									strings.Contains(err.Error(), "429:") {
+									Sfln("%s auctionPubkey is being ratelimited: %s", auctionPubkey, err)
+									return err
+								}
+								Sfln(Red("err while %s: %s"), auctionPubkey, err)
+								err = stm.Append(&EmptyItem{
+									AuctionKey: auctionPubkey,
+								})
+								checkError(err)
+								return nil
+							}
+							return err
+						})...)
 			})
-			checkError(err)
-		}
+
 	}
 
 	// TODO:
@@ -117,14 +159,64 @@ func run(client *rpc.Client, stm *streamject.Stream) {
 	// 		- after last 00 00 00 comes the domain
 }
 
+type Doer struct {
+	wg  *sync.WaitGroup
+	sem *semaphore.Weighted
+}
+
+func NewProcessor(maxWorkers int64) *Doer {
+	return &Doer{
+		wg:  &sync.WaitGroup{},
+		sem: semaphore.NewWeighted(maxWorkers),
+	}
+}
+
+//
+func (un *Doer) Enqueue(etac *eta.ETA, id solana.PublicKey, job func() error) {
+	if err := un.sem.Acquire(context.Background(), 1); err != nil {
+		panic(err)
+	}
+	un.wg.Add(1)
+
+	go un.doer(etac, id, job)
+}
+
+//
+func (un *Doer) doer(etac *eta.ETA, id solana.PublicKey, job func() error) {
+	defer etac.Done(1)
+	defer un.wg.Done()
+	defer un.sem.Release(1)
+
+	err := job()
+	if err != nil {
+		Errorf(
+			"fatal error while processing %s: %s",
+			id,
+			err,
+		)
+	} else {
+		Successf(
+			"[%s](%v/%v) Success %s",
+			etac.GetFormattedPercentDone(),
+			etac.GetDone()+1,
+			etac.GetTotal(),
+			id,
+		)
+	}
+}
+
+func (un *Doer) Wait() error {
+	un.wg.Wait()
+	Errorln(LimeBG(">>> Completed. <<<"))
+	return nil
+}
+
 func processAuction(
 	stm *streamject.Stream,
 	client *rpc.Client,
 	auctionPubkey solana.PublicKey,
 	isProd bool,
 ) error {
-	Sfln(Shakespeare("----- %s"), "auctionPubkey above")
-
 	ctx := context.Background()
 	signatures, err := client.GetConfirmedSignaturesForAddress2(
 		ctx,
@@ -135,8 +227,10 @@ func processAuction(
 		return err
 	}
 
-	spew.Dump(signatures)
-	Sfln(Shakespeare("----- %s"), "signatures above")
+	if debug {
+		spew.Dump(signatures)
+		Sfln(Shakespeare("----- %s"), "signatures above")
+	}
 
 	if len(signatures) == 0 {
 		return errors.New("no signatures")
@@ -146,8 +240,10 @@ func processAuction(
 	// Figure out what is the domain in the auction (if any):
 	{
 		oldestSignature := signatures[len(signatures)-1]
-		spew.Dump(oldestSignature)
-		Sfln(Shakespeare("----- %s"), "oldestSignature above")
+		if debug {
+			spew.Dump(oldestSignature)
+			Sfln(Shakespeare("----- %s"), "oldestSignature above")
+		}
 
 		if oldestSignature.Err != nil {
 			return errors.New("oldestSignature has err")
@@ -160,8 +256,10 @@ func processAuction(
 		if err != nil {
 			return err
 		}
-		spew.Dump(tx)
-		Sfln(Shakespeare("----- %s"), "tx above")
+		if debug {
+			spew.Dump(tx)
+			Sfln(Shakespeare("----- %s"), "tx above")
+		}
 
 		if !SliceContains(tx.Meta.LogMessages, "Program log: Instruction: Create") {
 			return errors.New("NOT: Instruction: Create")
@@ -173,24 +271,32 @@ func processAuction(
 
 		lastInnerIndex := len(firstIntruction.Instructions) - 1
 		lastInner := firstIntruction.Instructions[lastInnerIndex]
-		Sfln("inner %v", lastInnerIndex+1)
 		programKey := tx.Transaction.Message.AccountKeys[lastInner.ProgramIDIndex]
-		Sfln(" program %s", programKey)
+		if debug {
+			Sfln("inner %v", lastInnerIndex+1)
+			Sfln(" program %s", programKey)
+		}
 		if !bonfidaNamesProgramKey.Equals(programKey) {
 			return errors.New("last instruction is not on bonfidaNamesProgramKey")
 		}
-		for _, accIndex := range lastInner.Accounts {
-			Sfln(" account %s", tx.Transaction.Message.AccountKeys[int(accIndex)])
+		if debug {
+			for _, accIndex := range lastInner.Accounts {
+				Sfln(" account %s", tx.Transaction.Message.AccountKeys[int(accIndex)])
+			}
 		}
 		un, err := base58.Decode(lastInner.Data.String())
 		if err != nil {
 			return err
 		}
-		spew.Dump(([]byte(un)))
+		if debug {
+			spew.Dump(([]byte(un)))
+		}
 
 		parts := bytes.Split([]byte(un), []byte{00, 00, 00})
 		name := parts[len(parts)-1]
-		spew.Dump(name)
+		if debug {
+			spew.Dump(name)
+		}
 
 		creator := tx.Transaction.Message.AccountKeys[0]
 		blockTimeInt64 := int64(*oldestSignature.BlockTime)
@@ -218,8 +324,11 @@ func processAuction(
 		canceledBids := make(map[string]bool)
 		for i := 0; i < len(signatures)-1; i++ {
 			mostRecentSignature := signatures[i]
-			spew.Dump(mostRecentSignature)
-			Sfln(Shakespeare("----- %s"), "mostRecentSignature above")
+
+			if debug {
+				spew.Dump(mostRecentSignature)
+				Sfln(Shakespeare("----- %s"), "mostRecentSignature above")
+			}
 			if mostRecentSignature.Err != nil {
 				continue
 			}
@@ -231,8 +340,10 @@ func processAuction(
 			if err != nil {
 				return err
 			}
-			spew.Dump(tx)
-			Sfln(Shakespeare("----- %s"), "tx above")
+			if debug {
+				spew.Dump(tx)
+				Sfln(Shakespeare("----- %s"), "tx above")
+			}
 			// bidder := tx.Transaction.Message.AccountKeys[postTokenBalance.AccountIndex]
 			bidder := tx.Transaction.Message.AccountKeys[0]
 
@@ -279,11 +390,13 @@ func processAuction(
 			}
 
 			blockTimeInt64 := int64(*mostRecentSignature.BlockTime)
-			Sfln(
-				" latest offer from account %s for %v USDC",
-				bidder,
-				bidAmount,
-			)
+			if debug {
+				Sfln(
+					" latest offer from account %s for %v USDC",
+					bidder,
+					bidAmount,
+				)
+			}
 			// TODO:
 			// - check that it's a bid, and not a revoked bid
 			domainItem.MaxBid.Amount = bidAmount
@@ -295,7 +408,9 @@ func processAuction(
 			break
 		}
 	} else {
-		Sfln("warn: No offers at the moment")
+		if debug {
+			Sfln("warn: No offers at the moment")
+		}
 	}
 
 	return stm.Append(&domainItem)
